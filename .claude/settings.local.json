@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.zenrows.com)",
+      "WebFetch(domain:stackoverflow.com)",
+      "WebFetch(domain:www.scrapingbee.com)",
+      "WebFetch(domain:www.scrapehero.com)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

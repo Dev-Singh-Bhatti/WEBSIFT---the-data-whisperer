@@ -1,8 +1,12 @@
 import pandas as pd
 from .database_connect import mongo_operation as mongo
 import os, sys
+import logging
 from src.constants import *
+from src.config import DATABASE_URL
 from src.exception import CustomException
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -12,12 +16,13 @@ class MongoIO:
     _database_name = None
 
     def __init__(self):
-        # Store connection details but don't connect yet (lazy loading)
+        # Store connection details but don't connect yet (lazy loading).
+        # Kept class name for backward compatibility, backend is SQLite.
         if MongoIO._connection_url is None:
-            mongo_db_url = "mongodb+srv://kanishqverma01_db_user:g8vmQW2mNppqbGPU@cluster0.r8c59mm.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-            if mongo_db_url is None:
-                raise Exception(f"Environment key: {MONGODB_URL_KEY} is not set.")
-            MongoIO._connection_url = mongo_db_url
+            db_url = DATABASE_URL
+            if not db_url:
+                raise Exception("DATABASE_URL is not set.")
+            MongoIO._connection_url = db_url
             MongoIO._database_name = MONGO_DATABASE_NAME
     
     def _ensure_connection(self):
@@ -111,5 +116,51 @@ class MongoIO:
             DataFrame with reviews from all platforms
         """
         return self.get_reviews(product_name=product_name, platform=None)
-
+    
+    def store_summary(self,
+                     product_name: str,
+                     summary: str,
+                     platform: str = None):
+        """
+        Store review summary in SQLite summary table.
+        
+        Args:
+            product_name: Name of the product
+            summary: Summary text
+            platform: Platform name (optional, None for all-platform summary)
+        """
+        try:
+            self.mongo_ins.upsert_summary(
+                product_name=product_name,
+                platform=platform,
+                summary=summary,
+            )
+            logger.info(f"Stored summary for {product_name} (platform: {platform or 'all'})")
+            
+        except Exception as e:
+            logger.error(f"Error storing summary: {e}")
+            raise CustomException(f"Failed to store summary: {e}", sys)
+    
+    def get_summary(self,
+                   product_name: str,
+                   platform: str = None) -> str:
+        """
+        Get review summary from SQLite.
+        
+        Args:
+            product_name: Name of the product
+            platform: Platform name (optional, None for all-platform summary)
+            
+        Returns:
+            Summary string or None if not found
+        """
+        try:
+            return self.mongo_ins.get_summary(
+                product_name=product_name,
+                platform=platform,
+            )
+            
+        except Exception as e:
+            logger.error(f"Error retrieving summary: {e}")
+            return None
 

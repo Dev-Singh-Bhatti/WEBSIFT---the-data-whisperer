@@ -1,14 +1,20 @@
 from selenium import webdriver 
 from selenium.webdriver.common.by import By 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    TimeoutException,
+    InvalidSessionIdException,
+    WebDriverException
+)
 from src.exception import CustomException
 from bs4 import BeautifulSoup as bs
 import pandas as pd
 import os, sys
-import time
 from selenium.webdriver.chrome.options import Options 
 from urllib.parse import quote
 from src.scrapper.base_scraper import BaseScraper
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ScrapeReviews(BaseScraper):
@@ -30,13 +36,14 @@ class ScrapeReviews(BaseScraper):
             for attempt in range(max_retries):
                 try:
                     # Navigate to the URL
+                    self._apply_rate_limit()
                     self.driver.get(url)
-                    time.sleep(3)  # Wait for initial page load
+                    self.scaled_sleep(3)  # Wait for initial page load
                     
                     # Check if page loaded successfully (not an error page)
                     if "ERR_" in self.driver.page_source or "can't be reached" in self.driver.page_source.lower():
                         if attempt < max_retries - 1:
-                            time.sleep(2 * (attempt + 1))  # Exponential backoff
+                            self.scaled_sleep(2 * (attempt + 1))  # Exponential backoff
                             continue
                         else:
                             raise CustomException(
@@ -47,7 +54,7 @@ class ScrapeReviews(BaseScraper):
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1))
+                        self.scaled_sleep(2 * (attempt + 1))
                         continue
                     else:
                         raise
@@ -80,35 +87,71 @@ class ScrapeReviews(BaseScraper):
 
     def extract_reviews(self, product_link):
         try:
+            # Check if session is still valid before proceeding
+            if not self.is_session_valid():
+                logger.warning("Browser session is invalid, skipping product")
+                return None
+            
             productLink = "https://www.myntra.com/" + product_link
             
             # Retry logic for network errors
             max_retries = 3
             for attempt in range(max_retries):
                 try:
+                    # Check session before each operation
+                    if not self.is_session_valid():
+                        logger.warning("Browser session lost during retry, skipping product")
+                        return None
+                    
+                    self._apply_rate_limit()
                     self.driver.get(productLink)
-                    time.sleep(3)  # Wait for product page to load
+                    self.scaled_sleep(3)  # Wait for product page to load
+                    
+                    # Check session before accessing page_source
+                    if not self.is_session_valid():
+                        logger.warning("Browser session lost after page load, skipping product")
+                        return None
                     
                     # Check if page loaded successfully
                     if "ERR_" in self.driver.page_source or "can't be reached" in self.driver.page_source.lower():
                         if attempt < max_retries - 1:
-                            time.sleep(2 * (attempt + 1))
+                            self.scaled_sleep(2 * (attempt + 1))
                             continue
                         else:
                             return None  # Skip this product if it fails to load
                     break
+                except (InvalidSessionIdException, WebDriverException) as e:
+                    logger.warning(f"Browser session error during page load (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        self.scaled_sleep(2 * (attempt + 1))
+                        continue
+                    else:
+                        return None  # Skip this product on persistent session errors
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1))
+                        self.scaled_sleep(2 * (attempt + 1))
                         continue
                     else:
                         return None  # Skip this product on persistent errors
             
             # Wait for product page content
             try:
+                # Check session before wait operation
+                if not self.is_session_valid():
+                    logger.warning("Browser session lost before waiting for content, skipping product")
+                    return None
+                
                 self.wait.until(lambda d: "pdp-price" in d.page_source or "index-overallRating" in d.page_source)
+            except (InvalidSessionIdException, WebDriverException) as e:
+                logger.warning(f"Browser session error during wait: {str(e)}")
+                return None  # Skip this product if session is lost
             except TimeoutException:
                 pass  # Continue parsing even if explicit wait fails
+            
+            # Check session before accessing page_source
+            if not self.is_session_valid():
+                logger.warning("Browser session lost before extracting page source, skipping product")
+                return None
             
             prodRes = self.driver.page_source
             prodRes_html = bs(prodRes, "html.parser")
@@ -142,7 +185,15 @@ class ScrapeReviews(BaseScraper):
             if not product_reviews:
                 return None
             return product_reviews
+        except (InvalidSessionIdException, WebDriverException) as e:
+            logger.warning(f"Browser session error in extract_reviews: {str(e)}")
+            return None  # Gracefully skip this product
         except Exception as e:
+            # Check if it's a session-related error in the message
+            error_msg = str(e).lower()
+            if "invalid session" in error_msg or "session deleted" in error_msg or "disconnected" in error_msg:
+                logger.warning(f"Browser session error detected: {str(e)}")
+                return None  # Gracefully skip this product
             raise CustomException(e, sys)
         
 
@@ -172,20 +223,21 @@ class ScrapeReviews(BaseScraper):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
+                    self._apply_rate_limit()
                     self.driver.get(Review_link)
-                    time.sleep(2)  # Wait for review page to load
+                    self.scaled_sleep(2)  # Wait for review page to load
                     
                     # Check if page loaded successfully
                     if "ERR_" in self.driver.page_source or "can't be reached" in self.driver.page_source.lower():
                         if attempt < max_retries - 1:
-                            time.sleep(2 * (attempt + 1))
+                            self.scaled_sleep(2 * (attempt + 1))
                             continue
                         else:
                             return pd.DataFrame()  # Return empty if review page fails
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1))
+                        self.scaled_sleep(2 * (attempt + 1))
                         continue
                     else:
                         return pd.DataFrame()  # Return empty on persistent errors
@@ -197,7 +249,7 @@ class ScrapeReviews(BaseScraper):
                 pass  # Continue parsing even if explicit wait fails
             
             self.scroll_to_load_reviews()
-            time.sleep(1)  # Brief wait after scrolling
+            self.scaled_sleep(1)  # Brief wait after scrolling
             
             review_page = self.driver.page_source
             review_html = bs(review_page, "html.parser")

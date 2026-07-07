@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  scraper-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: myntra-review-scraper
+    ports:
+      - "8501:8501"
+      - "5900:5900"
+    environment:
+      - DISPLAY=:99
+
+      # Database Configuration (SQLite default)
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./app.db}
+      
+      # Proxy Configuration
+      - PROXY_ENABLED=${PROXY_ENABLED:-False}
+      - PROXY_LIST=${PROXY_LIST:-}
+      
+      # Delay Configuration (in seconds)
+      - MIN_DELAY=${MIN_DELAY:-2}
+      - MAX_DELAY=${MAX_DELAY:-5}
+      - DELAY_VARIANCE=${DELAY_VARIANCE:-0.3}
+      
+      # Retry Configuration
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - RETRY_BACKOFF_FACTOR=${RETRY_BACKOFF_FACTOR:-2.0}
+      - INITIAL_RETRY_DELAY=${INITIAL_RETRY_DELAY:-1.0}
+      
+      # Timeout Configuration (in seconds)
+      - PAGE_LOAD_TIMEOUT=${PAGE_LOAD_TIMEOUT:-30}
+      - ELEMENT_WAIT_TIMEOUT=${ELEMENT_WAIT_TIMEOUT:-15}
+      - IMPLICIT_WAIT=${IMPLICIT_WAIT:-10}
+      - BROWSER_HEADLESS=${BROWSER_HEADLESS:-False}
+      - PAGE_LOAD_STRATEGY=${PAGE_LOAD_STRATEGY:-eager}
+      - DELAY_SCALE=${DELAY_SCALE:-0.5}
+      
+      # Stealth Configuration
+      - USE_STEALTH=${USE_STEALTH:-True}
+      - ROTATE_USER_AGENT=${ROTATE_USER_AGENT:-True}
+      - RANDOMIZE_FINGERPRINT=${RANDOMIZE_FINGERPRINT:-True}
+      
+      # Rate Limiting
+      - REQUESTS_PER_HOUR=${REQUESTS_PER_HOUR:-100}
+      - REQUESTS_PER_MINUTE=${REQUESTS_PER_MINUTE:-10}
+      
+      # Logging Configuration
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=${LOG_DIR:-logs}
+    volumes:
+      - ./logs:/app/logs
+      - ./data.csv:/app/data.csv
+    restart: unless-stopped
+    shm_size: '2gb'  # Required for Chrome in Docker
+    networks:
+      - scraper-network
+
+networks:
+  scraper-network:
+    driver: bridge

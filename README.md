@@ -1,2 +1,1 @@
-# myntra_review_project-main
-
+# Myntra Review Scraper project

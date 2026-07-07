@@ -1,387 +1,460 @@
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from src.exception import CustomException
+﻿from src.exception import CustomException
 from bs4 import BeautifulSoup as bs
 import pandas as pd
 import os, sys
-import time
+import random
 import re
-from urllib.parse import quote
+import logging
+from urllib.parse import quote, urlparse
+from typing import Optional
 from src.scrapper.base_scraper import BaseScraper
+from src.utils.scraping_utils import check_bot_detection
+from src.config import PROXY_ENABLED, PROXY_LIST
+
+logger = logging.getLogger(__name__)
 
 
 class AmazonScraper(BaseScraper):
     platform_name = "amazon"
-    
+
+    def __init__(self, product_name: str, no_of_products: int, proxy: Optional[str] = None):
+        """
+        Initialize Amazon scraper and visit homepage first to establish session.
+
+        Args:
+            product_name: Product name to search
+            no_of_products: Number of products to scrape
+            proxy: Optional proxy string
+        """
+        selected_proxy = None
+        if proxy:
+            selected_proxy = proxy
+        elif PROXY_ENABLED and PROXY_LIST:
+            selected_proxy = random.choice(PROXY_LIST)
+            logger.info(
+                "Using random proxy from pool: %s",
+                selected_proxy.split("@")[-1] if "@" in selected_proxy else selected_proxy,
+            )
+
+        super().__init__(product_name, no_of_products, proxy=selected_proxy)
+
+        try:
+            self._apply_rate_limit()
+            self.driver.get("https://www.amazon.in")
+            self.random_delay(3, 5, human_like=True)
+            self.human_like_mouse_move()
+
+            if check_bot_detection(self.driver.page_source, "amazon"):
+                logger.warning("Bot detection detected on Amazon homepage")
+                self.random_delay(10, 15, human_like=True)
+        except Exception as e:
+            logger.warning(f"Homepage visit warning: {e}")
+
+    def _normalize_text(self, value):
+        if value is None:
+            return ""
+        normalized = str(value).replace("\xa0", " ")
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _extract_asin_from_url(self, url):
+        if not url:
+            return None
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?]|$)", path, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        return None
+
+    def _absolutize_amazon_url(self, href):
+        href = self._normalize_text(href)
+        if not href:
+            return None
+        if href.startswith("http"):
+            return href
+        if href.startswith("/"):
+            return f"https://www.amazon.in{href}"
+        return f"https://www.amazon.in/{href}"
+
+    def _parse_rating_text(self, text):
+        normalized = self._normalize_text(text).replace(",", "")
+        if not normalized:
+            return "No rating Given"
+        for match in re.findall(r"\d+(?:\.\d+)?", normalized):
+            try:
+                value = float(match)
+            except ValueError:
+                continue
+            if 0 < value <= 5:
+                return match
+        return "No rating Given"
+
+    def _parse_price_text(self, text):
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return "N/A"
+        normalized_no_commas = normalized.replace(",", "")
+        inr_match = re.search(r"(?:₹|rs\.?|inr)\s*(\d+(?:\.\d+)?)", normalized_no_commas, re.IGNORECASE)
+        if inr_match:
+            return f"INR {inr_match.group(1)}"
+        generic_match = re.search(r"\b(\d{2,}(?:\.\d+)?)\b", normalized_no_commas)
+        if generic_match:
+            return generic_match.group(1)
+        return "N/A"
+
+    def _create_product_fallback_dataframe(self, reason):
+        return pd.DataFrame([
+            {
+                "Product Name": self.product_title or "Unknown Product",
+                "Over_All_Rating": self.product_rating_value or "N/A",
+                "Price": self.product_price or "N/A",
+                "Date": "N/A",
+                "Rating": "N/A",
+                "Name": "N/A",
+                "Comment": reason,
+            }
+        ])
+
+    def _extract_review_link_from_product_page(self, html, asin):
+        if asin:
+            specific_see_all = html.select_one(
+                f'a[data-hook="see-all-reviews-link-foot"][href*="{asin}"]'
+            )
+            if specific_see_all and specific_see_all.get("href"):
+                return self._absolutize_amazon_url(specific_see_all.get("href"))
+
+        generic_see_all = html.select_one('a[data-hook="see-all-reviews-link-foot"][href]')
+        if generic_see_all and generic_see_all.get("href"):
+            candidate = self._absolutize_amazon_url(generic_see_all.get("href"))
+            if candidate and (not asin or f"/product-reviews/{asin}" in candidate):
+                return candidate
+
+        if asin:
+            for anchor in html.select(f'a[href*="/product-reviews/{asin}"]'):
+                href = self._normalize_text(anchor.get("href"))
+                if not href:
+                    continue
+                if "show_all" in href or "reviewerType=all_reviews" in href:
+                    return self._absolutize_amazon_url(href)
+
+            return (
+                f"https://www.amazon.in/product-reviews/{asin}/"
+                "?reviewerType=all_reviews&pageNumber=1&sortBy=recent"
+            )
+
+        return None
+
+    def _is_signin_or_block_page(self):
+        title = self._normalize_text(getattr(self.driver, "title", "")).lower()
+        current_url = self._normalize_text(getattr(self.driver, "current_url", "")).lower()
+        source = self.driver.page_source.lower()
+
+        if "amazon sign-in" in title or "/ap/signin" in current_url:
+            return True
+        if check_bot_detection(source, "amazon"):
+            return True
+        return False
+
+    def _extract_review_from_container(self, container):
+        rating_elem = (
+            container.select_one('[data-hook="review-star-rating"]')
+            or container.select_one('[data-hook="cmps-review-star-rating"]')
+            or container.select_one("span.a-icon-alt")
+        )
+        rating = self._parse_rating_text(rating_elem.get_text(" ", strip=True) if rating_elem else "")
+
+        title_elem = container.select_one('[data-hook="review-title"]')
+        title = self._normalize_text(title_elem.get_text(" ", strip=True) if title_elem else "")
+        title = re.sub(r"^\d+(?:\.\d+)?\s*out of\s*5\s*stars?\s*", "", title, flags=re.IGNORECASE)
+
+        body_elem = container.select_one('[data-hook="review-body"]')
+        body = self._normalize_text(body_elem.get_text(" ", strip=True) if body_elem else "")
+        body = re.sub(r"\s*Read more\s*$", "", body, flags=re.IGNORECASE)
+
+        name_elem = container.select_one("span.a-profile-name") or container.select_one('[data-hook="review-author"]')
+        name = self._normalize_text(name_elem.get_text(" ", strip=True) if name_elem else "")
+        if not name:
+            name = "No Name given"
+
+        date_elem = container.select_one('[data-hook="review-date"]')
+        date_text = self._normalize_text(date_elem.get_text(" ", strip=True) if date_elem else "")
+        if date_text:
+            match = re.search(r"\bon\s+(.+)$", date_text, flags=re.IGNORECASE)
+            date = self._normalize_text(match.group(1) if match else date_text)
+        else:
+            date = "No Date given"
+
+        comment = ""
+        if title and body:
+            if title.lower() in body.lower():
+                comment = body
+            else:
+                comment = f"{title}. {body}"
+        elif body:
+            comment = body
+        elif title:
+            comment = title
+
+        comment = self._normalize_text(comment)
+        if not comment:
+            comment = "No comment Given"
+
+        # Quality gates: drop empty/metadata-only rows.
+        if comment == "No comment Given" and rating == "No rating Given":
+            return None
+        if date == "No Date given" and name == "No Name given":
+            return None
+
+        return {
+            "Product Name": self.product_title or "Unknown Product",
+            "Over_All_Rating": self.product_rating_value or "N/A",
+            "Price": self.product_price or "N/A",
+            "Date": date,
+            "Rating": rating,
+            "Name": name,
+            "Comment": comment,
+        }
+
     def scrape_product_urls(self, product_name: str) -> list:
         """
         Scrape product URLs from Amazon search results.
-        
+
         Args:
             product_name: Product name to search for
-            
+
         Returns:
-            List of product URLs
+            List of canonical product URLs
         """
         try:
             encoded_query = quote(product_name)
             search_url = f"https://www.amazon.in/s?k={encoded_query}"
-            
-            # Add headers to mimic browser request
-            self.driver.get(search_url)
-            time.sleep(3)
-            
-            # Scroll to load more products
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            
-            page_source = self.driver.page_source
-            html = bs(page_source, "html.parser")
-            
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self._apply_rate_limit()
+                    self.driver.get(search_url)
+                    self.random_delay(4, 7, human_like=True)
+
+                    page_source = self.driver.page_source
+                    if check_bot_detection(page_source, "amazon"):
+                        if attempt < max_retries - 1:
+                            logger.warning("Amazon search blocked/detected. Retrying...")
+                            self.random_delay(8, 12, human_like=True)
+                            continue
+                        return []
+                    break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        self.random_delay(3, 6, human_like=True)
+                        continue
+                    return []
+
+            # Light scroll to trigger lazy-loaded cards without huge latency.
+            for _ in range(3):
+                self.driver.execute_script("window.scrollBy(0, 1200);")
+                self.scaled_sleep(0.8, min_sleep=0.1)
+
+            html = bs(self.driver.page_source, "html.parser")
             product_urls = []
-            
-            # Amazon product links have class: a-link-normal s-underline-text s-underline-text-text-display-block
-            # Also can be in: a-link-normal s-link-style a-text-normal
-            product_links = html.find_all("a", href=True, class_=lambda x: x and ("s-underline-text" in str(x) or "s-link-style" in str(x)))
-            
-            for link in product_links:
-                href = link.get("href", "")
-                if href:
-                    # Filter for product URLs (contain /dp/ or /gp/product/)
-                    if "/dp/" in href or "/gp/product/" in href:
-                        # Convert relative URLs to absolute
-                        if href.startswith("/"):
-                            href = f"https://www.amazon.in{href}"
-                        elif not href.startswith("http"):
-                            href = f"https://www.amazon.in/{href}"
-                        
-                        # Extract clean URL (remove ref parameters)
-                        if "/dp/" in href:
-                            clean_url = href.split("/dp/")[0] + "/dp/" + href.split("/dp/")[1].split("/")[0]
-                        elif "/gp/product/" in href:
-                            clean_url = href.split("/gp/product/")[0] + "/gp/product/" + href.split("/gp/product/")[1].split("/")[0]
-                        else:
-                            clean_url = href.split("?")[0]
-                        
-                        if clean_url not in product_urls:
-                            product_urls.append(clean_url)
-            
-            return product_urls[:self.no_of_products * 2]  # Get extra URLs in case some don't have reviews
-            
+
+            result_cards = html.select("div.s-main-slot div[data-component-type='s-search-result']")
+            for card in result_cards:
+                asin = self._normalize_text(card.get("data-asin"))
+                if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+                    continue
+                canonical_url = f"https://www.amazon.in/dp/{asin}"
+                if canonical_url not in product_urls:
+                    product_urls.append(canonical_url)
+
+            # Fallback path when card parsing fails.
+            if not product_urls:
+                for anchor in html.find_all("a", href=True):
+                    href = self._normalize_text(anchor.get("href"))
+                    asin = self._extract_asin_from_url(href)
+                    if not asin:
+                        continue
+                    canonical_url = f"https://www.amazon.in/dp/{asin}"
+                    if canonical_url not in product_urls:
+                        product_urls.append(canonical_url)
+
+            return product_urls[: self.no_of_products * 2]
+
         except Exception as e:
             raise CustomException(e, sys)
-    
+
     def extract_reviews(self, product_url):
         """
-        Navigate to product page, extract metadata, and scroll to reviews section.
-        Returns product URL to stay on same page for review extraction.
-        
+        Open product page and extract product metadata plus review page link.
+
         Args:
             product_url: Full Amazon product URL
-            
+
         Returns:
-            Product URL if successful, None if product not found
+            Dict with product_url/review_url/asin, or None when page fails
         """
         try:
-            self.driver.get(product_url)
-            time.sleep(3)
-            
-            page_source = self.driver.page_source
-            
-            # Check for bot detection/blocked page
-            if "To discuss automated access to Amazon data please contact" in page_source:
-                raise CustomException(
-                    f"Page {product_url} was blocked by Amazon. Please try using better proxies or reduce request frequency.",
-                    sys
-                )
-            
-            html = bs(page_source, "html.parser")
-            
-            # Extract product title - try multiple selectors
-            title_elem = html.find("span", {"id": "productTitle"})
-            if not title_elem:
-                title_elem = html.find("h1", {"class": "a-size-large"})
-            if not title_elem:
-                title_elem = html.find("h1", class_=lambda x: x and "product-title" in str(x).lower())
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self._apply_rate_limit()
+                    self.driver.get(product_url)
+                    self.random_delay(4, 7, human_like=True)
+
+                    if check_bot_detection(self.driver.page_source, "amazon"):
+                        if attempt < max_retries - 1:
+                            self.random_delay(8, 12, human_like=True)
+                            continue
+                        return None
+                    break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        self.random_delay(3, 6, human_like=True)
+                        continue
+                    return None
+
+            html = bs(self.driver.page_source, "html.parser")
+            current_url = self.driver.current_url or product_url
+            asin = self._extract_asin_from_url(current_url) or self._extract_asin_from_url(product_url)
+
+            title_elem = html.select_one("#productTitle") or html.select_one("h1.a-size-large")
             if title_elem:
-                self.product_title = title_elem.text.strip()
+                self.product_title = self._normalize_text(title_elem.get_text(" ", strip=True))
             else:
-                self.product_title = "Unknown Product"
-            
-            # Extract overall rating - improved parsing like reference
-            rating_elem = html.find("span", {"class": "a-icon-alt"})
+                title_tag = html.find("title")
+                if title_tag:
+                    self.product_title = self._normalize_text(title_tag.get_text(strip=True).split("|")[0])
+                else:
+                    self.product_title = "Unknown Product"
+
+            rating_elem = html.select_one("#acrPopover") or html.select_one("span.a-icon-alt")
+            rating_text = ""
             if rating_elem:
-                rating_text = rating_elem.text.strip()
-                # Reference pattern: split ' out of' and take first part
-                if ' out of' in rating_text:
-                    self.product_rating_value = rating_text.split(' out of')[0].strip()
-                else:
-                    # Fallback: extract number
-                    rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                    self.product_rating_value = rating_match.group(1) if rating_match else "N/A"
-            else:
-                # Try alternative selectors
-                rating_elem = html.find("span", {"id": "acrPopover"})
-                if rating_elem:
-                    rating_text = rating_elem.get("title", "")
-                    if ' out of' in rating_text:
-                        self.product_rating_value = rating_text.split(' out of')[0].strip()
-                    else:
-                        self.product_rating_value = "N/A"
-                else:
-                    self.product_rating_value = "N/A"
-            
-            # Extract price - improved extraction
-            price_elem = html.find("span", {"class": "a-price-whole"})
-            if price_elem:
-                price_text = price_elem.text.strip().replace(",", "")
-                self.product_price = f"₹{price_text}"
-            else:
-                price_elem = html.find("span", {"id": "priceblock_dealprice"})
-                if not price_elem:
-                    price_elem = html.find("span", {"id": "priceblock_ourprice"})
-                if not price_elem:
-                    price_elem = html.find("span", {"id": "priceblock_saleprice"})
-                if price_elem:
-                    price_text = price_elem.text.strip().replace(",", "")
-                    self.product_price = price_text
-                else:
-                    self.product_price = "N/A"
-            
-            # Scroll to reviews section at bottom of page
-            self._scroll_to_reviews_section()
-            
-            return product_url
-                
+                rating_text = rating_elem.get("title") or rating_elem.get_text(" ", strip=True)
+            self.product_rating_value = self._parse_rating_text(rating_text)
+            if self.product_rating_value == "No rating Given":
+                self.product_rating_value = "N/A"
+
+            price_elem = (
+                html.select_one("#corePrice_feature_div span.a-price span.a-offscreen")
+                or html.select_one("span.a-price span.a-offscreen")
+                or html.select_one("#priceblock_ourprice")
+                or html.select_one("#priceblock_dealprice")
+                or html.select_one("#priceblock_saleprice")
+                or html.select_one("span.a-price-whole")
+            )
+            self.product_price = self._parse_price_text(price_elem.get_text(" ", strip=True) if price_elem else "")
+
+            review_url = self._extract_review_link_from_product_page(html, asin)
+
+            return {
+                "product_url": current_url,
+                "review_url": review_url,
+                "asin": asin,
+            }
+
         except CustomException:
             raise
         except Exception as e:
             raise CustomException(e, sys)
-    
-    def _scroll_to_reviews_section(self):
+
+    def extract_products(self, review_data):
         """
-        Scroll to reviews section on product page and wait for reviews to load.
-        """
-        try:
-            # Try to find reviews section by multiple selectors
-            reviews_selectors = [
-                "#reviews-section",
-                "#customerReviews",
-                "[data-hook='reviews-section']",
-                "section[id*='reviews']",
-                "div[id*='reviews']"
-            ]
-            
-            reviews_element = None
-            for selector in reviews_selectors:
-                try:
-                    if selector.startswith("#"):
-                        # ID selector
-                        element_id = selector[1:]
-                        reviews_element = self.driver.find_element(By.ID, element_id)
-                    elif selector.startswith("["):
-                        # Attribute selector - use XPath or CSS
-                        reviews_element = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    else:
-                        # Tag selector with attribute
-                        reviews_element = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    
-                    if reviews_element:
-                        break
-                except:
-                    continue
-            
-            # If reviews section found, scroll to it
-            if reviews_element:
-                self.driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'start'});", reviews_element)
-                time.sleep(2)
-            else:
-                # Fallback: scroll to bottom of page
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
-            
-            # Scroll incrementally to load lazy-loaded reviews
-            last_height = self.driver.execute_script("return document.body.scrollHeight")
-            scroll_attempts = 0
-            max_scroll_attempts = 3
-            
-            while scroll_attempts < max_scroll_attempts:
-                # Scroll down a bit more
-                self.driver.execute_script("window.scrollBy(0, 800);")
-                time.sleep(1)
-                
-                new_height = self.driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
-                last_height = new_height
-                scroll_attempts += 1
-            
-            # Small delay for any remaining dynamic content
-            time.sleep(1)
-            
-        except Exception:
-            # If scrolling fails, just scroll to bottom as fallback
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-    
-    def extract_products(self, product_url):
-        """
-        Extract individual reviews from current Amazon product page (reviews section at bottom).
-        Based on scrapehero reference implementation patterns.
-        
+        Extract individual reviews from Amazon review surface.
+
         Args:
-            product_url: Product URL (already on this page, no navigation needed)
-            
+            review_data: dict from extract_reviews (or legacy product URL str)
+
         Returns:
             DataFrame with reviews
         """
         try:
-            # Already on product page, no need to navigate
-            # Ensure we're scrolled to reviews section
-            self._scroll_to_reviews_section()
-            
-            # Get page source after scrolling
-            page_source = self.driver.page_source
-            
-            # Check for bot detection/blocked page
-            if "To discuss automated access to Amazon data please contact" in page_source:
-                raise CustomException(
-                    f"Product page {product_url} was blocked by Amazon. Please try using better proxies or reduce request frequency.",
-                    sys
-                )
-            
-            # Additional scroll to ensure all lazy-loaded reviews are visible
-            self.scroll_to_load_reviews()
-            
-            # Re-fetch page source after additional scrolling
-            page_source = self.driver.page_source
-            html = bs(page_source, "html.parser")
-            
-            # Find review containers - Amazon uses data-hook="review" (same on product page)
-            review_containers = html.find_all("div", {"data-hook": "review"})
-            
-            # If no reviews found with data-hook, try alternative selectors
-            if not review_containers:
-                # Try finding reviews in reviews section container
-                reviews_section = html.find("div", {"id": "reviews-section"}) or html.find("div", {"id": "customerReviews"})
-                if reviews_section:
-                    review_containers = reviews_section.find_all("div", {"data-hook": "review"})
-            
-            # Fallback: try any div with review-related class
-            if not review_containers:
-                review_containers = html.find_all("div", class_=lambda x: x and "review" in str(x).lower())
-            
-            reviews = []
-            
-            for container in review_containers:
+            if not review_data:
+                return self._create_product_fallback_dataframe("Product page unavailable")
+
+            if isinstance(review_data, dict):
+                product_url = review_data.get("product_url")
+                review_url = review_data.get("review_url")
+            else:
+                product_url = str(review_data)
+                review_url = None
+
+            loaded_target = False
+
+            # Try dedicated review page first.
+            if review_url:
+                max_retries = 2
+                for attempt in range(max_retries):
+                    try:
+                        self._apply_rate_limit()
+                        self.driver.get(review_url)
+                        self.scaled_sleep(3)
+                        if self._is_signin_or_block_page():
+                            if attempt < max_retries - 1:
+                                self.random_delay(4, 7, human_like=True)
+                                continue
+                            break
+                        loaded_target = True
+                        break
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            self.random_delay(3, 6, human_like=True)
+                            continue
+                        break
+
+            # Fallback to product page review section.
+            if not loaded_target and product_url:
                 try:
-                    # Extract rating - improved parsing like reference
-                    rating_elem = container.find("span", {"class": "a-icon-alt"})
-                    if rating_elem:
-                        rating_text = rating_elem.text.strip()
-                        # Reference pattern: split ' out of' and take first part
-                        if ' out of' in rating_text:
-                            rating = rating_text.split(' out of')[0].strip()
-                        else:
-                            # Fallback: extract number
-                            rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                            rating = rating_match.group(1) if rating_match else "No rating Given"
-                    else:
-                        # Try finding rating in i tag with class containing "star"
-                        rating_i = container.find("i", class_=lambda x: x and "star" in str(x).lower())
-                        if rating_i:
-                            rating_text = rating_i.get("class", [""])[0] if rating_i.get("class") else ""
-                            rating_match = re.search(r'(\d+)', rating_text)
-                            rating = rating_match.group(1) if rating_match else "No rating Given"
-                        else:
-                            rating = "No rating Given"
-                    
-                    # Extract review title - improved extraction
-                    title_elem = container.find("a", {"data-hook": "review-title"})
-                    title = ""
-                    if title_elem:
-                        # Get all spans and extract text
-                        title_spans = title_elem.find_all("span")
-                        if title_spans:
-                            title = " ".join([span.text.strip() for span in title_spans if span.text.strip()])
-                        else:
-                            title = title_elem.text.strip()
-                    
-                    # Extract comment/review text - improved extraction like reference
-                    comment_elem = container.find("span", {"data-hook": "review-body"})
-                    comment = ""
-                    if comment_elem:
-                        # Get all spans inside review-body (nested structure)
-                        comment_spans = comment_elem.find_all("span")
-                        if comment_spans:
-                            # Get the innermost span with actual text
-                            for span in reversed(comment_spans):
-                                span_text = span.text.strip()
-                                if span_text and len(span_text) > 10:  # Likely the actual review text
-                                    comment = span_text
-                                    break
-                            if not comment:
-                                comment = " ".join([s.text.strip() for s in comment_spans if s.text.strip()])
-                        else:
-                            comment = comment_elem.text.strip()
-                    else:
-                        comment = "No comment Given"
-                    
-                    # Combine title and comment if both exist
-                    if title and comment:
-                        comment = f"{title}. {comment}"
-                    elif title:
-                        comment = title
-                    
-                    # Extract reviewer name - improved extraction
-                    name_elem = container.find("span", {"class": "a-profile-name"})
-                    if not name_elem:
-                        name_elem = container.find("div", {"class": "a-profile-name"})
-                    if not name_elem:
-                        # Try alternative selector
-                        name_elem = container.find("span", class_=lambda x: x and "profile-name" in str(x).lower())
-                    name = name_elem.text.strip() if name_elem else "No Name given"
-                    
-                    # Extract date - improved parsing like reference
-                    date_elem = container.find("span", {"data-hook": "review-date"})
-                    if date_elem:
-                        date_text = date_elem.text.strip()
-                        # Reference pattern: extract date after "on " 
-                        if "on " in date_text:
-                            date = date_text.split("on ")[-1].strip()
-                        else:
-                            date = date_text
-                    else:
-                        date_elem = container.find("span", {"class": "a-size-base a-color-secondary review-date"})
-                        if date_elem:
-                            date_text = date_elem.text.strip()
-                            if "on " in date_text:
-                                date = date_text.split("on ")[-1].strip()
-                            else:
-                                date = date_text
-                        else:
-                            date = "No Date given"
-                    
-                    review_dict = {
-                        "Product Name": self.product_title,
-                        "Over_All_Rating": self.product_rating_value,
-                        "Price": self.product_price,
-                        "Date": date,
-                        "Rating": rating,
-                        "Name": name,
-                        "Comment": comment,
-                    }
-                    reviews.append(review_dict)
-                    
-                except Exception as e:
-                    # Skip malformed reviews but log for debugging
+                    self._apply_rate_limit()
+                    self.driver.get(product_url)
+                    self.scaled_sleep(3)
+                    # Trigger lazy review section render.
+                    self.driver.execute_script("window.scrollBy(0, document.body.scrollHeight * 0.75);")
+                    self.scaled_sleep(1.2, min_sleep=0.2)
+                except Exception:
+                    pass
+
+            html = bs(self.driver.page_source, "html.parser")
+
+            review_containers = []
+            container_selectors = [
+                "#cm-cr-review_list [data-hook='review']",
+                "#cm-cr-dp-review-list [data-hook='review']",
+                "li[data-hook='review']",
+                "div[data-hook='review']",
+            ]
+            for selector in container_selectors:
+                candidates = html.select(selector)
+                if candidates:
+                    review_containers = candidates
+                    break
+
+            if not review_containers:
+                return self._create_product_fallback_dataframe("No review containers found")
+
+            reviews = []
+            seen = set()
+
+            for container in review_containers:
+                parsed = self._extract_review_from_container(container)
+                if not parsed:
                     continue
-            
+
+                dedupe_key = (
+                    parsed.get("Name"),
+                    parsed.get("Date"),
+                    parsed.get("Comment"),
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                reviews.append(parsed)
+
             if not reviews:
-                return pd.DataFrame()
-            
-            review_data = pd.DataFrame(
+                return self._create_product_fallback_dataframe("No parseable reviews found")
+
+            return pd.DataFrame(
                 reviews,
                 columns=[
                     "Product Name",
@@ -393,11 +466,8 @@ class AmazonScraper(BaseScraper):
                     "Comment",
                 ],
             )
-            
-            return review_data
-            
+
         except CustomException:
             raise
         except Exception as e:
             raise CustomException(e, sys)
-
