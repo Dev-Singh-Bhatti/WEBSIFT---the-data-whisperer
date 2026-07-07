@@ -1,1 +1,6 @@
-# Myntra Review Scraper project
+WEBSIFT – The Data Whisperer is a Python-based web scraping system developed to collect and compare product information from major e-commerce platforms, including Amazon, Flipkart, and Myntra. The project addresses the challenge of comparing products across different websites by automatically extracting data such as product names, prices, ratings, customer reviews, reviewer details, and review dates. Since these platforms do not provide public APIs for review data, WEBSIFT uses web scraping techniques to gather the required information.
+
+The system is built using Python, Selenium, BeautifulSoup, and ThreadPoolExecutor for efficient data extraction and parallel scraping. The collected data is cleaned, normalized, and stored in MongoDB, making it suitable for analysis and future use. A Streamlit based web interface allows users to search for products, compare prices and ratings across platforms, and view the results in a simple and interactive format.
+
+WEBSIFT helps consumers make informed purchasing decisions by providing transparent, side-by-side comparisons of products available on different e-commerce websites. It also serves as a useful tool for researchers and businesses interested in market analysis, pricing strategies, and customer sentiment. The project's modular architecture, scalable design, and focus on ethical web scraping practices make it a strong foundation for future enhancements such as sentiment analysis, price prediction, and AI-powered product recommendations.
+
